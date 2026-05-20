@@ -5,6 +5,7 @@ import datetime
 import os
 import textwrap
 
+import anthropic
 import feedparser
 import requests
 from sendgrid import SendGridAPIClient
@@ -13,6 +14,7 @@ from sendgrid.helpers.mail import Mail
 SENDGRID_API_KEY = os.environ["SENDGRID_API_KEY"]
 TO_EMAIL = os.environ["TO_EMAIL"]
 FROM_EMAIL = os.environ["FROM_EMAIL"]
+ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 BRIEFING_HOUR_UTC = int(os.environ.get("BRIEFING_HOUR_UTC", "7"))
 
 RSS_FEEDS = [
@@ -118,6 +120,121 @@ def fetch_cisa_kev(days_back: int = 1) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
+# Claude executive summary
+# ---------------------------------------------------------------------------
+
+_CISO_SYSTEM_PROMPT = """\
+You are a senior threat intelligence analyst briefing the CISO of a large international \
+telecommunications company. Your audience is a seasoned executive who manages risk for a \
+carrier operating mobile, fixed-line, and wholesale networks across multiple continents, \
+with deep exposure to SS7/Diameter interconnect abuse, OT/ICS infrastructure, supply chain \
+risks in network equipment (RAN, core, OSS/BSS), nation-state actors targeting critical \
+infrastructure, and regulatory obligations across jurisdictions (FCC, GDPR, NIS2, OFCOM).
+
+Write concisely. Lead with the most operationally relevant findings. Flag anything that:
+- Directly threatens telecom protocols (SS7, Diameter, GTP, SIP, ISUP, BGP)
+- Affects network equipment vendors (Ericsson, Nokia, Huawei, Cisco, Juniper, etc.)
+- Is actively exploited by nation-state or ransomware actors targeting carriers
+- Has regulatory or compliance implications for a global telecom operator
+- Affects OT/SCADA systems relevant to data centers or network infrastructure
+
+Structure your response as three clearly labeled sections:
+1. **EXECUTIVE SUMMARY** — 3–5 sentences, the single most important risk picture today
+2. **KEY THREATS FOR TELECOM** — bullet list of 3–6 items most relevant to our environment
+3. **RECOMMENDED ACTIONS** — bullet list of 2–4 concrete, actionable next steps for today
+
+Tone: direct, no filler, no pleasantries. Write as if this will be read in 90 seconds \
+between executive meetings.\
+"""
+
+
+def generate_executive_summary(
+    cves: list[dict],
+    kev: list[dict],
+    rss_data: list[tuple[str, list[dict]]],
+) -> str:
+    if not ANTHROPIC_API_KEY:
+        return ""
+
+    # Build a compact plaintext digest to feed Claude
+    lines = []
+
+    if kev:
+        lines.append("=== CISA KNOWN EXPLOITED VULNERABILITIES (NEW TODAY) ===")
+        for v in kev:
+            lines.append(
+                f"- {v.get('cveID','')} | {v.get('vendorProject','')} {v.get('product','')} | "
+                f"{v.get('vulnerabilityName','')} | Due: {v.get('dueDate','')}"
+            )
+
+    if cves:
+        lines.append("\n=== TOP NEW CVEs BY CVSS (LAST 24 HOURS) ===")
+        for c in cves:
+            score = f"{c['cvss']:.1f}" if c["cvss"] else "N/A"
+            lines.append(f"- {c['id']} [{c['severity']} {score}] — {c['description'][:200]}")
+
+    lines.append("\n=== NEWS HEADLINES ===")
+    for feed_name, items in rss_data:
+        for item in items:
+            lines.append(f"- [{feed_name}] {item['title']}")
+
+    digest = "\n".join(lines)
+
+    try:
+        client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
+        response = client.messages.create(
+            model="claude-opus-4-7",
+            max_tokens=1024,
+            thinking={"type": "adaptive"},
+            system=[
+                {
+                    "type": "text",
+                    "text": _CISO_SYSTEM_PROMPT,
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+            messages=[
+                {
+                    "role": "user",
+                    "content": (
+                        f"Today's threat intelligence digest:\n\n{digest}\n\n"
+                        "Produce your CISO briefing now."
+                    ),
+                }
+            ],
+        )
+        # Extract text blocks (skip thinking blocks)
+        return "\n".join(
+            block.text for block in response.content if block.type == "text"
+        ).strip()
+    except Exception as exc:
+        print(f"[WARN] Claude summary failed: {exc}")
+        return ""
+
+
+def _markdown_to_html(text: str) -> str:
+    """Convert the minimal markdown Claude uses (bold, bullets) to inline HTML."""
+    import re
+    lines = text.split("\n")
+    html_lines = []
+    for line in lines:
+        # Section headers like **EXECUTIVE SUMMARY**
+        line = re.sub(r"^\*\*(.+?)\*\*$", r"<strong>\1</strong>", line)
+        # Inline bold
+        line = re.sub(r"\*\*(.+?)\*\*", r"<strong>\1</strong>", line)
+        # Bullet points
+        if line.startswith("- "):
+            line = f'<li style="margin:3px 0;">{line[2:]}</li>'
+        elif line == "":
+            line = "<br>"
+        html_lines.append(line)
+    # Wrap consecutive <li> in <ul>
+    result = "\n".join(html_lines)
+    result = re.sub(r"((?:<li[^>]*>.*?</li>\n?)+)", r"<ul style='margin:6px 0;padding-left:20px;'>\1</ul>", result)
+    return result
+
+
+# ---------------------------------------------------------------------------
 # HTML email builder
 # ---------------------------------------------------------------------------
 
@@ -154,10 +271,32 @@ def build_html(
     rss_data: list[tuple[str, list[dict]]],
     cves: list[dict],
     kev: list[dict],
+    executive_summary: str = "",
 ) -> str:
     critical_count = sum(1 for c in cves if (c["cvss"] or 0) >= CVSS_CRITICAL_THRESHOLD)
     high_count = sum(1 for c in cves if CVSS_HIGH_THRESHOLD <= (c["cvss"] or 0) < CVSS_CRITICAL_THRESHOLD)
     kev_count = len(kev)
+
+    # Build Claude executive summary block
+    summary_block = ""
+    if executive_summary:
+        summary_html = _markdown_to_html(executive_summary)
+        summary_block = f"""
+        <!-- Claude Executive Summary -->
+        <tr><td style="background:#1a1a2e;padding:24px 40px;">
+          <table width="100%" cellpadding="0" cellspacing="0">
+            <tr><td>
+              <div style="display:flex;align-items:center;gap:10px;margin-bottom:12px;">
+                <span style="font-size:18px;">&#129302;</span>
+                <span style="color:#a0b4c8;font-size:11px;text-transform:uppercase;
+                             letter-spacing:2px;font-weight:600;">AI-Powered CISO Briefing</span>
+              </div>
+              <div style="color:#e8eaf0;font-size:14px;line-height:1.7;">
+                {summary_html}
+              </div>
+            </td></tr>
+          </table>
+        </td></tr>"""
 
     # Build RSS rows
     rss_rows = ""
@@ -254,6 +393,8 @@ def build_html(
           </tr></table>
         </td></tr>
 
+        {summary_block}
+
         <!-- Body -->
         <tr><td style="padding:0 40px 32px 40px;">
           <table width="100%" cellpadding="0" cellspacing="0">
@@ -322,7 +463,14 @@ def main() -> None:
     kev = fetch_cisa_kev(days_back=1)
     print(f"  {len(kev)} KEV additions today")
 
-    html = build_html(date_str, rss_data, cves, kev)
+    print("Generating Claude executive summary...")
+    executive_summary = generate_executive_summary(cves, kev, rss_data)
+    if executive_summary:
+        print("  Summary generated.")
+    else:
+        print("  Skipped (no API key or error).")
+
+    html = build_html(date_str, rss_data, cves, kev, executive_summary)
 
     subject = f"[CyberBrief] {today.strftime('%Y-%m-%d')} — {len(kev)} KEV | {sum(1 for c in cves if (c['cvss'] or 0) >= CVSS_CRITICAL_THRESHOLD)} Critical CVEs"
     print(f"Sending: {subject}")

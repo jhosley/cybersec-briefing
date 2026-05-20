@@ -33,6 +33,7 @@ In your repo: **Settings → Secrets and variables → Actions → New repositor
 | `SENDGRID_API_KEY` | Your SendGrid API key |
 | `TO_EMAIL` | Your email address (where to receive the briefing) |
 | `FROM_EMAIL` | Verified sender address in SendGrid |
+| `ANTHROPIC_API_KEY` | Your Anthropic API key (for the Claude CISO executive summary) |
 
 ### 5. Adjust the schedule (optional)
 

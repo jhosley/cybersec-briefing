@@ -29,4 +29,5 @@ jobs:
           SENDGRID_API_KEY: ${{ secrets.SENDGRID_API_KEY }}
           TO_EMAIL: ${{ secrets.TO_EMAIL }}
           FROM_EMAIL: ${{ secrets.FROM_EMAIL }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python briefing.py
