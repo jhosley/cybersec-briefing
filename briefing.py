@@ -210,12 +210,19 @@ def generate_executive_summary(
         full_text = "\n".join(
             block.text for block in response.content if block.type == "text"
         ).strip()
+        print(f"[DEBUG] Claude raw output:\n{full_text[:800]}")
 
-        # Split BLUF from the rest
+        # Split BLUF from the rest — robust to numbering variants like "**0. BLUF**"
         import re
-        bluf_match = re.search(r"\*\*BLUF\*\*\s*\n+(.*?)(?=\n+\*\*)", full_text, re.DOTALL)
-        bluf = bluf_match.group(1).strip() if bluf_match else ""
-        rest = full_text[bluf_match.end():].strip() if bluf_match else full_text
+        sections = re.split(r'\n(?=\*\*)', full_text)
+        bluf = ""
+        rest_sections = []
+        for section in sections:
+            if re.match(r'\*\*(?:\d+\.\s*)?BLUF\*\*', section, re.IGNORECASE):
+                bluf = re.sub(r'\*\*(?:\d+\.\s*)?BLUF\*\*[:\s\-—]*\n*', '', section, flags=re.IGNORECASE).strip()
+            else:
+                rest_sections.append(section)
+        rest = "\n".join(rest_sections).strip()
         return bluf, rest
     except Exception as exc:
         print(f"[WARN] Claude summary failed: {exc}")
