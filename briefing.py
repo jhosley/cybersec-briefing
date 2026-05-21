@@ -138,7 +138,11 @@ Write concisely. Lead with the most operationally relevant findings. Flag anythi
 - Has regulatory or compliance implications for a global telecom operator
 - Affects OT/SCADA systems relevant to data centers or network infrastructure
 
-Structure your response as three clearly labeled sections:
+Structure your response as four clearly labeled sections:
+0. **BLUF** — 2–3 sentences of pure narrative. Answer one question: "How should I think \
+about today's threat landscape?" Give the mental frame — the pattern, the trend, the \
+posture. No bullets. Write it as if you're handing the CISO a single thought to carry \
+into their morning.
 1. **EXECUTIVE SUMMARY** — 3–5 sentences, the single most important risk picture today
 2. **KEY THREATS FOR TELECOM** — bullet list of 3–6 items most relevant to our environment
 3. **RECOMMENDED ACTIONS** — bullet list of 2–4 concrete, actionable next steps for today
@@ -184,7 +188,7 @@ def generate_executive_summary(
         client = anthropic.Anthropic(api_key=ANTHROPIC_API_KEY)
         response = client.messages.create(
             model="claude-opus-4-7",
-            max_tokens=1024,
+            max_tokens=1200,
             thinking={"type": "adaptive"},
             system=[
                 {
@@ -203,13 +207,19 @@ def generate_executive_summary(
                 }
             ],
         )
-        # Extract text blocks (skip thinking blocks)
-        return "\n".join(
+        full_text = "\n".join(
             block.text for block in response.content if block.type == "text"
         ).strip()
+
+        # Split BLUF from the rest
+        import re
+        bluf_match = re.search(r"\*\*BLUF\*\*\s*\n+(.*?)(?=\n+\*\*)", full_text, re.DOTALL)
+        bluf = bluf_match.group(1).strip() if bluf_match else ""
+        rest = full_text[bluf_match.end():].strip() if bluf_match else full_text
+        return bluf, rest
     except Exception as exc:
         print(f"[WARN] Claude summary failed: {exc}")
-        return ""
+        return "", ""
 
 
 def _markdown_to_html(text: str) -> str:
@@ -271,11 +281,25 @@ def build_html(
     rss_data: list[tuple[str, list[dict]]],
     cves: list[dict],
     kev: list[dict],
+    bluf: str = "",
     executive_summary: str = "",
 ) -> str:
     critical_count = sum(1 for c in cves if (c["cvss"] or 0) >= CVSS_CRITICAL_THRESHOLD)
     high_count = sum(1 for c in cves if CVSS_HIGH_THRESHOLD <= (c["cvss"] or 0) < CVSS_CRITICAL_THRESHOLD)
     kev_count = len(kev)
+
+    # Build BLUF block — sits between header and stats bar
+    bluf_block = ""
+    if bluf:
+        bluf_block = f"""
+        <!-- BLUF -->
+        <tr><td style="background:#0f3460;padding:20px 40px 18px 40px;
+                        border-bottom:1px solid #1a4a7a;">
+          <p style="margin:0;color:#ffffff;font-size:15px;line-height:1.75;
+                    font-style:italic;letter-spacing:0.1px;">
+            {bluf}
+          </p>
+        </td></tr>"""
 
     # Build Claude executive summary block
     summary_block = ""
@@ -371,6 +395,8 @@ def build_html(
           <p style="margin:8px 0 0 0;color:#a0b4c8;font-size:14px;">{date_str}</p>
         </td></tr>
 
+        {bluf_block}
+
         <!-- Summary bar -->
         <tr><td style="background:#eaf0fb;padding:16px 40px;border-bottom:1px solid #d6e4f0;">
           <table width="100%" cellpadding="0" cellspacing="0"><tr>
@@ -464,13 +490,13 @@ def main() -> None:
     print(f"  {len(kev)} KEV additions today")
 
     print("Generating Claude executive summary...")
-    executive_summary = generate_executive_summary(cves, kev, rss_data)
-    if executive_summary:
+    bluf, executive_summary = generate_executive_summary(cves, kev, rss_data)
+    if bluf or executive_summary:
         print("  Summary generated.")
     else:
         print("  Skipped (no API key or error).")
 
-    html = build_html(date_str, rss_data, cves, kev, executive_summary)
+    html = build_html(date_str, rss_data, cves, kev, bluf, executive_summary)
 
     subject = f"[CyberBrief] {today.strftime('%Y-%m-%d')} — {len(kev)} KEV | {sum(1 for c in cves if (c['cvss'] or 0) >= CVSS_CRITICAL_THRESHOLD)} Critical CVEs"
     print(f"Sending: {subject}")
